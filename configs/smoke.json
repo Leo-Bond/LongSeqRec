@@ -1,0 +1,7 @@
+{
+  "output": "runs/smoke",
+  "models": ["mean", "din", "sasrec", "sim", "twin", "dare", "dare_shared", "dare_no_long", "dare_no_time"],
+  "seeds": [1],
+  "data": {"kind": "synthetic", "seed": 2026, "users": 24, "interactions_per_user": 40, "categories": 8, "items_per_category": 8, "history_length": 30, "negatives": 1, "hard_negative_ratio": 0.5},
+  "training": {"device": "auto", "epochs": 1, "batch_size": 64, "lr": 0.001, "model": {"dim": 8, "topk": 8, "recent_length": 8, "time_buckets": 32}}
+}
