@@ -23,6 +23,26 @@ class SequenceDataset(Dataset):
                                  "history_category", "time_gap", "label"))
 
 
+class IndexedSequenceDataset(Dataset):
+    """Materialize only the current batch history from a shared positive log."""
+    def __init__(self,store,indices):self.store,self.indices=store,np.asarray(indices,dtype=np.int64)
+    def __len__(self):return len(self.indices)
+    def __getitem__(self,position):
+        row=int(self.indices[position]);store=self.store;user=int(store["user"][row]);end=int(store["positive_offset"][user]+store["prior_count"][row]);begin=max(int(store["positive_offset"][user]),end-store["history_length"]);history_rows=store["positive_rows"][begin:end]
+        length=store["history_length"];items=np.zeros(length,np.int64);categories=np.zeros(length,np.int64);gaps=np.zeros(length,np.int64);start=length-len(history_rows)
+        items[start:]=store["item"][history_rows];categories[start:]=store["category"][history_rows]
+        delta=np.maximum(0,store["timestamp"][row]-store["timestamp"][history_rows]);gaps[start:]=np.minimum(31,np.floor(np.log2(delta+1)).astype(np.int64)+1)
+        return (torch.tensor(store["item"][row],dtype=torch.long),torch.tensor(store["category"][row],dtype=torch.long),torch.from_numpy(items).long(),torch.from_numpy(categories).long(),torch.from_numpy(gaps).long(),torch.tensor(store["label"][row],dtype=torch.long))
+
+
+@dataclass
+class IndexedPreparedData:
+    store:dict
+    splits:dict
+    metadata:dict
+    def dataset(self,part):return IndexedSequenceDataset(self.store,self.splits[part])
+
+
 def _remap(values):
     _, inverse = np.unique(values, return_inverse=True)
     return inverse.astype(np.int64) + 1
@@ -58,7 +78,33 @@ def load_events(config):
     return np.column_stack([source[key] for key in required] + [label])
 
 
+def prepare_indexed(config):
+    """Build O(events) storage for full-scale labeled impression logs."""
+    source=np.load(Path(config["path"]));required=("user_id","item_id","category_id","timestamp","label")
+    missing=[key for key in required if key not in source]
+    if missing:raise ValueError(f"indexed data requires labeled arrays: {missing}")
+    user=_remap(source["user_id"]).astype(np.int32);item=_remap(source["item_id"]).astype(np.int32);category=_remap(source["category_id"]).astype(np.int16);timestamp=np.asarray(source["timestamp"],np.int64);label=np.asarray(source["label"],np.int8)
+    order=np.lexsort((timestamp,user));user,item,category,timestamp,label=[value[order] for value in (user,item,category,timestamp,label)]
+    users=int(user.max());prior_count=np.zeros(len(user),np.int32);positive_offset=np.zeros(users+2,np.int64);positive_parts=[];splits={name:[] for name in ("train","valid","test")}
+    boundaries=np.r_[0,np.flatnonzero(np.diff(user))+1,len(user)]
+    for begin,end in zip(boundaries[:-1],boundaries[1:]):
+        local_positive=np.flatnonzero(label[begin:end]==1)+begin;positive_parts.append(local_positive);positive_offset[int(user[begin])]=sum(len(part) for part in positive_parts[:-1])
+        prior_count[begin:end]=np.searchsorted(local_positive,np.arange(begin,end),side="left")
+        n=end-begin;split1=begin+int(.8*n);split2=begin+int(.9*n);splits["train"].append(np.arange(begin,split1));splits["valid"].append(np.arange(split1,split2));splits["test"].append(np.arange(split2,end))
+    positive_rows=np.concatenate(positive_parts).astype(np.int64);positive_offset[users+1]=len(positive_rows)
+    # Fill offset gaps defensively; remapping normally makes users contiguous.
+    for uid in range(users,0,-1):
+        if positive_offset[uid]==0 and uid!=1:positive_offset[uid]=positive_offset[uid+1]
+    split_arrays={name:np.concatenate(parts).astype(np.int64) for name,parts in splits.items()}
+    minimum=int(config.get("minimum_history",1));eligible=prior_count>=minimum
+    split_arrays={name:rows[eligible[rows]] for name,rows in split_arrays.items()}
+    store=dict(user=user,item=item,category=category,timestamp=timestamp,label=label,prior_count=prior_count,positive_rows=positive_rows,positive_offset=positive_offset,history_length=int(config.get("history_length",200)))
+    metadata={"num_items":int(item.max()),"num_categories":int(category.max()),"history_length":store["history_length"],"examples":int(sum(map(len,split_arrays.values()))),"positive_rate":float(label.mean()),"split_examples":{k:len(v) for k,v in split_arrays.items()},"average_history_length":float(np.minimum(prior_count,store["history_length"])[eligible].mean()),"storage":"indexed_dynamic_history"}
+    return IndexedPreparedData(store,split_arrays,metadata)
+
+
 def prepare(config):
+    if config.get("kind")=="indexed_npz":return prepare_indexed(config)
     events = load_events(config).copy()
     events[:, 0] = _remap(events[:, 0]); events[:, 1] = _remap(events[:, 1]); events[:, 2] = _remap(events[:, 2])
     order = np.lexsort((events[:, 3], events[:, 0])); events = events[order]

@@ -1,0 +1,7 @@
+{
+  "output": "runs/kuairand_mac_full",
+  "models": ["din", "sim", "twin", "dare", "dare_shared"],
+  "seeds": [1],
+  "data": {"kind": "indexed_npz", "path": "data/kuairand_1k.npz", "history_length": 100, "minimum_history": 5},
+  "training": {"device": "mps", "epochs": 1, "batch_size": 256, "lr": 0.001, "weight_decay": 0.00001, "model": {"dim": 16, "topk": 20, "recent_length": 20, "time_buckets": 32, "twin_heads": 4}}
+}

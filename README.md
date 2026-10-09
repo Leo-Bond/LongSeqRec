@@ -5,6 +5,10 @@ consumer GPU. The project compares Mean Pooling, DIN, SASRec, SIM, TWIN and DARE
 controlled training pipeline, and includes a synthetic dataset with persistent
 and short-term user interests.
 
+Models are decomposed into Event Encoder, General Search Unit, Exact Search Unit
+and CTR Tower components. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
+the model-to-paper mapping and implementation boundaries.
+
 ## Quick start
 
 ```bash
@@ -23,16 +27,18 @@ JSON, CSV, and a Markdown report under the configured output directory.
 - `din`: candidate-aware attention over only the recent history.
 - `sasrec`: causal self-attention over the complete behavior sequence.
 - `sim`: category-based general search over the long history, followed by DIN.
-- `twin`: learned top-k search and aggregation share the same matching
-  embedding and relevance scores.
+- `twin`: multi-head target attention with inherent/cross feature splitting;
+  CP-GSU and ESU share Q/K projections, cross-feature biases and relevance scores.
 - `dare`: TWIN with independent matching and representation embeddings.
 - `dare_shared`: DARE with the two tables tied, isolating embedding decoupling.
 - `dare_no_long`: DARE restricted to the recent window, isolating long history.
 - `dare_no_time`: DARE without time-gap embeddings.
 
-This is a compact, concept-level implementation rather than an exact reproduction
-of the industrial systems. SIM's general search uses category matching;
-TWIN/DARE use learned top-k retrieval and differentiable relevance weighting.
+This is a single-machine research implementation rather than a copy of private
+industrial serving systems. SIM uses hard category search. TWIN implements the
+paper's consistency-preserved multi-head target attention with the available
+KuaiRand fields: item/category as inherent features and time gap as a cross
+feature. DARE separates full attention and representation event encoders.
 
 ## Data
 
@@ -73,6 +79,18 @@ The converter streams the large CSV files, derives a coarse category from the
 first video tag, and writes an audit JSON with coverage and label statistics.
 Only earlier positive events enter a sample's history, preventing impression
 and future-information leakage.
+
+For all 1,000 users on an 18GB Apple Silicon Mac, use dynamic history indexing:
+
+```bash
+.venv/bin/python run_experiments.py \
+  --config configs/kuairand_mac_full.json \
+  --device mps
+```
+
+The default full-Mac study runs one epoch over the five core comparisons. Nine
+models over several epochs is a multi-day laptop workload rather than a memory
+requirement.
 
 ## Fair-comparison rules
 

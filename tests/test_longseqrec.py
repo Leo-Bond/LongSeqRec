@@ -48,7 +48,28 @@ class LongSeqRecTests(unittest.TestCase):
         torch.manual_seed(11);shared=build_model("dare_shared",self.data.metadata,config)
         torch.manual_seed(11);dare=build_model("dare",self.data.metadata,config)
         for key,value in shared.state_dict().items():
-            if key != "item_match.weight": self.assertTrue(torch.equal(value,dare.state_dict()[key]),key)
+            self.assertTrue(torch.equal(value,dare.state_dict()[key]),key)
+
+    def test_twin_cp_gsu_and_esu_share_relevance_scores(self):
+        a=self.data.arrays;rows=slice(0,4);model=build_model("twin",self.data.metadata,{"dim":8,"topk":3,"twin_heads":4})
+        item=torch.as_tensor(a["target_item"][rows]);category=torch.as_tensor(a["target_category"][rows]);history=torch.as_tensor(a["history_item"][rows]);history_category=torch.as_tensor(a["history_category"][rows]);gap=torch.as_tensor(a["time_gap"][rows]);mask=history.ne(0)
+        query=model.encoder(item,category);inherent=model.encoder(history,history_category);cross=model.encoder.time(gap);values=model.encoder(history,history_category,gap)
+        score=model.interest.relevance_scores(query,inherent,cross,mask);index=model.interest.search(score,mask);vector,weight=model.interest.exact(score,values,mask,index)
+        expected=score.mean(-1).masked_fill(~mask,-1e9).topk(3,1).indices
+        self.assertTrue(torch.equal(index,expected));self.assertEqual(tuple(score.shape),(4,8,4));self.assertEqual(tuple(vector.shape),(4,8));self.assertEqual(tuple(weight.shape),(4,3,4))
+
+    def test_twin_all_projections_receive_gradient(self):
+        a=self.data.arrays;rows=slice(0,4);inputs=[torch.as_tensor(a[key][rows],dtype=torch.long) for key in ("target_item","target_category","history_item","history_category","time_gap")]
+        model=build_model("twin",self.data.metadata,{"dim":8,"topk":3,"twin_heads":4});model(*inputs).sum().backward()
+        for name in ("query_projection","inherent_key_projection","cross_bias_projection","value_projection","output_projection"):
+            gradient=getattr(model.interest,name).weight.grad;self.assertIsNotNone(gradient,name);self.assertGreater(float(gradient.abs().sum()),0.,name)
+
+    def test_indexed_dataset_builds_strict_prior_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/"events.npz";np.savez(path,user_id=[1,1,1,2,2],item_id=[10,11,12,20,21],category_id=[1,1,2,2,2],timestamp=[1,2,3,1,2],label=[1,0,1,1,0])
+            indexed=prepare({"kind":"indexed_npz","path":str(path),"history_length":3,"minimum_history":1})
+            dataset=indexed.dataset("test");sample=dataset[0]
+            self.assertEqual(sample[2].shape[0],3);self.assertNotIn(int(sample[0]),sample[2].tolist());self.assertTrue(all(value.dtype==torch.long for value in sample))
 
     def test_kuairand_converter(self):
         with tempfile.TemporaryDirectory() as tmp:
