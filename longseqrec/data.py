@@ -18,9 +18,9 @@ class SequenceDataset(Dataset):
     def __len__(self): return len(self.indices)
     def __getitem__(self, position):
         row = int(self.indices[position])
-        return tuple(torch.as_tensor(self.arrays[key][row], dtype=torch.long)
-                     for key in ("target_item", "target_category", "history_item",
-                                 "history_category", "time_gap", "label"))
+        keys=("target_item","target_category","history_item","history_category","time_gap")
+        return {key:torch.as_tensor(self.arrays[key][row],dtype=torch.long) for key in keys} | {
+            "label":torch.as_tensor(self.arrays["label"][row],dtype=torch.long)}
 
 
 class IndexedSequenceDataset(Dataset):
@@ -28,11 +28,21 @@ class IndexedSequenceDataset(Dataset):
     def __init__(self,store,indices):self.store,self.indices=store,np.asarray(indices,dtype=np.int64)
     def __len__(self):return len(self.indices)
     def __getitem__(self,position):
-        row=int(self.indices[position]);store=self.store;user=int(store["user"][row]);end=int(store["positive_offset"][user]+store["prior_count"][row]);begin=max(int(store["positive_offset"][user]),end-store["history_length"]);history_rows=store["positive_rows"][begin:end]
-        length=store["history_length"];items=np.zeros(length,np.int64);categories=np.zeros(length,np.int64);gaps=np.zeros(length,np.int64);start=length-len(history_rows)
-        items[start:]=store["item"][history_rows];categories[start:]=store["category"][history_rows]
-        delta=np.maximum(0,store["timestamp"][row]-store["timestamp"][history_rows]);gaps[start:]=np.minimum(31,np.floor(np.log2(delta+1)).astype(np.int64)+1)
-        return (torch.tensor(store["item"][row],dtype=torch.long),torch.tensor(store["category"][row],dtype=torch.long),torch.from_numpy(items).long(),torch.from_numpy(categories).long(),torch.from_numpy(gaps).long(),torch.tensor(store["label"][row],dtype=torch.long))
+        row=int(self.indices[position]);s=self.store;uid=int(s["user"][row]);end=int(s["positive_offset"][uid]+s["prior_count"][row]);begin=max(int(s["positive_offset"][uid]),end-s["history_length"]);history_rows=s["positive_rows"][begin:end]
+        length=s["history_length"];start=length-len(history_rows)
+        def history_event(name,dtype=np.int64):
+            out=np.zeros(length,dtype);out[start:]=s[name][history_rows];return out
+        items=history_event("item");categories=history_event("category")
+        gaps=np.zeros(length,np.int64);delta=np.maximum(0,s["timestamp"][row]-s["timestamp"][history_rows]);gaps[start:]=np.minimum(31,np.floor(np.log2(delta+1)).astype(np.int64)+1)
+        item=int(s["item"][row]);target=lambda name:s[name][item]
+        history_tags=np.zeros((length,s["item_tags"].shape[1]),np.int64);history_tags[start:]=s["item_tags"][s["item"][history_rows]]
+        result={
+            "target_item":item,"target_category":int(s["category"][row]),"history_item":items,"history_category":categories,"time_gap":gaps,
+            "target_author":int(target("item_author")),"target_video_type":int(target("item_video_type")),"target_upload_type":int(target("item_upload_type")),"target_duration":int(target("item_duration")),"target_music_type":int(target("item_music_type")),"target_tags":target("item_tags"),
+            "history_author":history_event("event_author"),"history_video_type":history_event("event_video_type"),"history_upload_type":history_event("event_upload_type"),"history_duration":history_event("event_duration"),"history_music_type":history_event("event_music_type"),"history_tags":history_tags,
+            "history_behavior":history_event("behavior"),"history_play_ratio":history_event("play_ratio"),"user_features":s["user_features"][uid],"context":np.asarray([s["hour"][row],s["weekday"][row],s["tab"][row],s["is_rand"][row]],np.int64),"label":int(s["label"][row]),
+        }
+        return {key:torch.as_tensor(value,dtype=torch.long) for key,value in result.items()}
 
 
 @dataclass
@@ -46,6 +56,17 @@ class IndexedPreparedData:
 def _remap(values):
     _, inverse = np.unique(values, return_inverse=True)
     return inverse.astype(np.int64) + 1
+
+
+def _side_table(raw_unique, mapped_unique, source, field, width=None):
+    """Align video-level side information with the remapped item vocabulary."""
+    shape=(int(mapped_unique.max())+1,) if width is None else (int(mapped_unique.max())+1,width)
+    table=np.zeros(shape,np.int64)
+    if "video_feature_item_id" not in source or field not in source:return table
+    feature_ids=np.asarray(source["video_feature_item_id"],np.int64);values=np.asarray(source[field],np.int64)
+    pos=np.searchsorted(raw_unique,feature_ids);found=pos<len(raw_unique);found[found]&=raw_unique[pos[found]]==feature_ids[found]
+    table[mapped_unique[pos[found]]]=values[found]
+    return table
 
 
 def synthetic_events(config):
@@ -83,8 +104,25 @@ def prepare_indexed(config):
     source=np.load(Path(config["path"]));required=("user_id","item_id","category_id","timestamp","label")
     missing=[key for key in required if key not in source]
     if missing:raise ValueError(f"indexed data requires labeled arrays: {missing}")
-    user=_remap(source["user_id"]).astype(np.int32);item=_remap(source["item_id"]).astype(np.int32);category=_remap(source["category_id"]).astype(np.int16);timestamp=np.asarray(source["timestamp"],np.int64);label=np.asarray(source["label"],np.int8)
+    raw_user=np.asarray(source["user_id"],np.int64);raw_item=np.asarray(source["item_id"],np.int64)
+    raw_user_unique,user_inverse=np.unique(raw_user,return_inverse=True);user=(user_inverse+1).astype(np.int32)
+    raw_item_unique,item_inverse=np.unique(raw_item,return_inverse=True);item=(item_inverse+1).astype(np.int32);mapped_item_unique=np.arange(1,len(raw_item_unique)+1,dtype=np.int32)
+    category=_remap(source["category_id"]).astype(np.int16);timestamp=np.asarray(source["timestamp"],np.int64);label=np.asarray(source["label"],np.int8)
+    item_tables={
+        "item_author":_side_table(raw_item_unique,mapped_item_unique,source,"video_author"),
+        "item_video_type":_side_table(raw_item_unique,mapped_item_unique,source,"video_type"),
+        "item_upload_type":_side_table(raw_item_unique,mapped_item_unique,source,"video_upload_type"),
+        "item_duration":_side_table(raw_item_unique,mapped_item_unique,source,"video_duration"),
+        "item_music_type":_side_table(raw_item_unique,mapped_item_unique,source,"video_music_type"),
+        "item_tags":_side_table(raw_item_unique,mapped_item_unique,source,"video_tags",3),
+    }
+    # Build user profiles aligned with the remapped user vocabulary without repeating them per event.
+    cards=np.asarray(source["user_feature_cardinalities"],np.int64) if "user_feature_cardinalities" in source else np.empty(0,np.int64)
+    user_features=np.zeros((int(user.max())+1,len(cards)),np.int64)
+    if len(cards) and "profile_user_id" in source:
+        mapped=np.arange(1,len(raw_user_unique)+1);profile_ids=np.asarray(source["profile_user_id"],np.int64);order_profile=np.argsort(profile_ids);sorted_ids=profile_ids[order_profile];pos=np.searchsorted(sorted_ids,raw_user_unique);found=pos<len(sorted_ids);found[found]&=sorted_ids[pos[found]]==raw_user_unique[found];user_features[mapped[found]]=np.asarray(source["user_features"])[order_profile[pos[found]]]
     order=np.lexsort((timestamp,user));user,item,category,timestamp,label=[value[order] for value in (user,item,category,timestamp,label)]
+    def event(name,default=0,dtype=np.int16):return np.asarray(source[name],dtype)[order] if name in source else np.full(len(user),default,dtype)
     users=int(user.max());prior_count=np.zeros(len(user),np.int32);positive_offset=np.zeros(users+2,np.int64);positive_parts=[];splits={name:[] for name in ("train","valid","test")}
     boundaries=np.r_[0,np.flatnonzero(np.diff(user))+1,len(user)]
     for begin,end in zip(boundaries[:-1],boundaries[1:]):
@@ -98,8 +136,10 @@ def prepare_indexed(config):
     split_arrays={name:np.concatenate(parts).astype(np.int64) for name,parts in splits.items()}
     minimum=int(config.get("minimum_history",1));eligible=prior_count>=minimum
     split_arrays={name:rows[eligible[rows]] for name,rows in split_arrays.items()}
-    store=dict(user=user,item=item,category=category,timestamp=timestamp,label=label,prior_count=prior_count,positive_rows=positive_rows,positive_offset=positive_offset,history_length=int(config.get("history_length",200)))
-    metadata={"num_items":int(item.max()),"num_categories":int(category.max()),"history_length":store["history_length"],"examples":int(sum(map(len,split_arrays.values()))),"positive_rate":float(label.mean()),"split_examples":{k:len(v) for k,v in split_arrays.items()},"average_history_length":float(np.minimum(prior_count,store["history_length"])[eligible].mean()),"storage":"indexed_dynamic_history"}
+    store=dict(user=user,item=item,category=category,timestamp=timestamp,label=label,prior_count=prior_count,positive_rows=positive_rows,positive_offset=positive_offset,history_length=int(config.get("history_length",200)),user_features=user_features,
+               hour=event("hour",0,np.uint8),weekday=event("weekday",0,np.uint8),tab=event("tab",0,np.uint8),is_rand=event("is_rand",0,np.uint8),behavior=event("behavior_code",0,np.uint8),play_ratio=event("play_ratio_bucket",0,np.uint8),**item_tables)
+    store.update(event_author=store["item_author"][item],event_video_type=store["item_video_type"][item],event_upload_type=store["item_upload_type"][item],event_duration=store["item_duration"][item],event_music_type=store["item_music_type"][item])
+    metadata={"num_items":int(item.max()),"num_categories":int(category.max()),"num_authors":int(store["item_author"].max()),"num_video_types":int(store["item_video_type"].max()),"num_upload_types":int(store["item_upload_type"].max()),"num_durations":int(store["item_duration"].max()),"num_music_types":int(store["item_music_type"].max()),"num_tags":int(store["item_tags"].max()),"num_behaviors":int(store["behavior"].max()),"num_play_ratios":int(store["play_ratio"].max()),"user_feature_cardinalities":cards.tolist(),"context_cardinalities":[24,7,int(store["tab"].max()),int(store["is_rand"].max())],"rich_features":bool(len(cards) or store["item_author"].max()),"history_length":store["history_length"],"examples":int(sum(map(len,split_arrays.values()))),"positive_rate":float(label.mean()),"split_examples":{k:len(v) for k,v in split_arrays.items()},"average_history_length":float(np.minimum(prior_count,store["history_length"])[eligible].mean()),"storage":"indexed_dynamic_history"}
     return IndexedPreparedData(store,split_arrays,metadata)
 
 

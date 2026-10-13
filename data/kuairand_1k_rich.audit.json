@@ -1,0 +1,19 @@
+{
+  "source": "/Users/wudingyuan/Desktop/my_github/rankmixer_toy/data/kuairand/KuaiRand-1K",
+  "logs": [
+    "log_standard_4_08_to_4_21_1k.csv",
+    "log_standard_4_22_to_5_08_1k.csv"
+  ],
+  "positive_field": "long_view",
+  "users": 1000,
+  "events": 11713045,
+  "items": 4369953,
+  "categories": 59,
+  "authors": 1407453,
+  "video_types": 3,
+  "music_types": 7,
+  "user_feature_fields": 26,
+  "positive_rate": 0.26205491398692654,
+  "unknown_category_rate": 0.025176203113707836,
+  "leakage_policy": "post-exposure feedback is used only when the event is in prior history"
+}

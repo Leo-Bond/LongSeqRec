@@ -13,12 +13,32 @@ def masked_softmax(score,mask):
 def batched_gather(values,index):return values.gather(1,index.unsqueeze(-1).expand(-1,-1,values.shape[-1]))
 
 class EventEncoder(nn.Module):
-    """Compose item, category and target-relative time into an event vector."""
-    def __init__(self,num_items,num_categories,dim,time_buckets=32):
-        super().__init__();self.item=nn.Embedding(num_items+1,dim,padding_idx=0);self.category=nn.Embedding(num_categories+1,dim,padding_idx=0);self.time=nn.Embedding(time_buckets+1,dim,padding_idx=0);self.norm=nn.LayerNorm(dim)
-    def forward(self,item,category,gap=None,use_time=True):
+    """Compose ID, content, time and prior-feedback fields into an event vector."""
+    def __init__(self,num_items,num_categories,dim,time_buckets=32,**sizes):
+        super().__init__();self.item=nn.Embedding(num_items+1,dim,padding_idx=0);self.category=nn.Embedding(num_categories+1,dim,padding_idx=0);self.time=nn.Embedding(time_buckets+1,dim,padding_idx=0)
+        self.side=nn.ModuleDict({name:nn.Embedding(max(0,int(size))+1,dim,padding_idx=0) for name,size in {
+            "author":sizes.get("num_authors",0),"video_type":sizes.get("num_video_types",0),"upload_type":sizes.get("num_upload_types",0),"duration":sizes.get("num_durations",0),"music_type":sizes.get("num_music_types",0),"tag":sizes.get("num_tags",0),"behavior":sizes.get("num_behaviors",0),"play_ratio":sizes.get("num_play_ratios",0)}.items()})
+        self.norm=nn.LayerNorm(dim)
+    def forward(self,item,category,gap=None,use_time=True,author=None,video_type=None,upload_type=None,duration=None,music_type=None,tags=None,behavior=None,play_ratio=None,use_feedback=True):
         value=self.item(item)+self.category(category)
+        for name,feature in (("author",author),("video_type",video_type),("upload_type",upload_type),("duration",duration),("music_type",music_type)):
+            if feature is not None:value=value+self.side[name](feature)
+        if tags is not None:
+            tag_value=self.side["tag"](tags);tag_mask=tags.ne(0).unsqueeze(-1);value=value+(tag_value*tag_mask).sum(-2)/tag_mask.sum(-2).clamp_min(1)
         if gap is not None and use_time:value=value+self.time(gap)
+        if use_feedback:
+            if behavior is not None:value=value+self.side["behavior"](behavior)
+            if play_ratio is not None:value=value+self.side["play_ratio"](play_ratio)
+        return self.norm(value)
+
+class FeatureGroupEncoder(nn.Module):
+    """Sum field-specific categorical embeddings for user or request features."""
+    def __init__(self,cardinalities,dim):
+        super().__init__();self.tables=nn.ModuleList([nn.Embedding(max(0,int(size))+1,dim,padding_idx=0) for size in cardinalities]);self.norm=nn.LayerNorm(dim)
+    def forward(self,features,reference):
+        if features is None or not self.tables:return torch.zeros_like(reference)
+        value=torch.zeros_like(reference)
+        for index,table in enumerate(self.tables):value=value+table(features[:,index])
         return self.norm(value)
 
 class Dice(nn.Module):
@@ -130,12 +150,12 @@ class DAREInterest(nn.Module):
         return InterestOutput((values*weight.unsqueeze(-1)).sum(1),auxiliary,index)
 
 class CTRTower(nn.Module):
-    def __init__(self,dim):super().__init__();self.net=nn.Sequential(nn.Linear(4*dim,4*dim),nn.BatchNorm1d(4*dim),nn.PReLU(),nn.Dropout(.1),nn.Linear(4*dim,2*dim),nn.PReLU(),nn.Linear(2*dim,1))
-    def forward(self,interest,target):return self.net(torch.cat((interest,target,interest-target,interest*target),-1)).squeeze(-1)
+    def __init__(self,dim):super().__init__();self.net=nn.Sequential(nn.Linear(6*dim,4*dim),nn.BatchNorm1d(4*dim),nn.PReLU(),nn.Dropout(.1),nn.Linear(4*dim,2*dim),nn.PReLU(),nn.Linear(2*dim,1))
+    def forward(self,interest,target,user,context):return self.net(torch.cat((interest,target,interest-target,interest*target,user,context),-1)).squeeze(-1)
 
 class LongSeqModel(nn.Module):
-    def __init__(self,kind,num_items,num_categories,dim=32,topk=20,recent_length=20,time_buckets=32,history_length=200,twin_heads=4):
-        super().__init__();self.kind=kind;self.recent_length=recent_length;self.encoder=EventEncoder(num_items,num_categories,dim,time_buckets);self.auxiliary_loss=None
+    def __init__(self,kind,num_items,num_categories,dim=32,topk=20,recent_length=20,time_buckets=32,history_length=200,twin_heads=4,feature_sizes=None,user_feature_cardinalities=(),context_cardinalities=(24,7,15,2)):
+        super().__init__();self.kind=kind;self.recent_length=recent_length;feature_sizes=feature_sizes or {};self.encoder=EventEncoder(num_items,num_categories,dim,time_buckets,**feature_sizes);self.user_encoder=FeatureGroupEncoder(user_feature_cardinalities,dim);self.context_encoder=FeatureGroupEncoder(context_cardinalities,dim);self.cross=nn.ModuleDict({"same_author":nn.Embedding(2,dim),"same_music":nn.Embedding(2,dim),"tag_overlap":nn.Embedding(4,dim),"duration_difference":nn.Embedding(32,dim)});self.auxiliary_loss=None
         if kind=="mean":self.interest=MeanInterest()
         elif kind=="din":self.interest=DINInterest(dim,recent_length)
         elif kind=="sasrec":self.interest=SASRecEncoder(dim,history_length,heads=2 if dim%2==0 else 1)
@@ -147,29 +167,40 @@ class LongSeqModel(nn.Module):
         # Extra DARE parameters are constructed last so shared parameters have
         # identical initialization in matched ablations.
         if kind in ("dare","dare_no_long","dare_no_time"):
-            self.match_encoder=EventEncoder(num_items,num_categories,dim,time_buckets);self.match_encoder.load_state_dict(self.encoder.state_dict())
+            self.match_encoder=EventEncoder(num_items,num_categories,dim,time_buckets,**feature_sizes);self.match_encoder.load_state_dict(self.encoder.state_dict())
     @property
     def item_repr(self):return self.encoder.item
     @property
     def item_match(self):return self.match_encoder.item if self.match_encoder is not None else self.encoder.item
-    def forward(self,target_items,target_categories,history_items,history_categories,time_gaps):
-        mask=history_items.ne(0);use_time=self.kind!="dare_no_time";target=self.encoder(target_items,target_categories);events=self.encoder(history_items,history_categories,time_gaps,use_time)
+    def forward(self,target_item,target_category,history_item,history_category,time_gap,target_author=None,target_video_type=None,target_upload_type=None,target_duration=None,target_music_type=None,target_tags=None,history_author=None,history_video_type=None,history_upload_type=None,history_duration=None,history_music_type=None,history_tags=None,history_behavior=None,history_play_ratio=None,user_features=None,context=None):
+        mask=history_item.ne(0);use_time=self.kind!="dare_no_time"
+        target_kwargs=dict(author=target_author,video_type=target_video_type,upload_type=target_upload_type,duration=target_duration,music_type=target_music_type,tags=target_tags,use_feedback=False)
+        history_kwargs=dict(author=history_author,video_type=history_video_type,upload_type=history_upload_type,duration=history_duration,music_type=history_music_type,tags=history_tags,behavior=history_behavior,play_ratio=history_play_ratio)
+        target=self.encoder(target_item,target_category,**target_kwargs);events=self.encoder(history_item,history_category,time_gap,use_time,**history_kwargs)
         if self.kind=="sasrec":output=InterestOutput(self.interest(events,mask),events.new_zeros(()))
         else:
-            kwargs=dict(history_categories=history_categories,target_category=target_categories)
+            kwargs=dict(history_categories=history_category,target_category=target_category)
             if self.kind=="twin":
-                kwargs.update(inherent_events=self.encoder(history_items,history_categories),
-                              cross_events=self.encoder.time(time_gaps) if use_time else torch.zeros_like(events))
+                inherent=self.encoder(history_item,history_category,author=history_author,video_type=history_video_type,upload_type=history_upload_type,duration=history_duration,music_type=history_music_type,tags=history_tags,use_feedback=False)
+                cross=self.encoder.time(time_gap) if use_time else torch.zeros_like(events)
+                if target_author is not None and history_author is not None:cross=cross+self.cross["same_author"](history_author.eq(target_author[:,None]).long())
+                if target_music_type is not None and history_music_type is not None:cross=cross+self.cross["same_music"](history_music_type.eq(target_music_type[:,None]).long())
+                if target_tags is not None and history_tags is not None:
+                    overlap=(history_tags.unsqueeze(-1).eq(target_tags[:,None,None,:]) & history_tags.unsqueeze(-1).ne(0)).any(-1).sum(-1).clamp_max(3)
+                    cross=cross+self.cross["tag_overlap"](overlap)
+                if target_duration is not None and history_duration is not None:cross=cross+self.cross["duration_difference"]((history_duration-target_duration[:,None]).abs().clamp_max(31))
+                kwargs.update(inherent_events=inherent,cross_events=cross)
             if self.kind=="dare_shared":kwargs.update(match_query=target,match_events=events)
             elif self.match_encoder is not None:
-                match_events=self.match_encoder(history_items,history_categories,time_gaps,use_time)
-                match_query=self.match_encoder(target_items,target_categories)
+                match_events=self.match_encoder(history_item,history_category,time_gap,use_time,**history_kwargs)
+                match_query=self.match_encoder(target_item,target_category,**target_kwargs)
                 if self.kind=="dare_no_long":
                     events=events[:,-self.recent_length:];mask=mask[:,-self.recent_length:];match_events=match_events[:,-self.recent_length:]
                 kwargs.update(match_query=match_query,match_events=match_events)
             output=self.interest(target,events,mask,**kwargs)
-        self.auxiliary_loss=output.auxiliary;return self.tower(output.vector,target)
+        self.auxiliary_loss=output.auxiliary;user=self.user_encoder(user_features,target);request=self.context_encoder(context,target);return self.tower(output.vector,target,user,request)
     def loss(self,logits,labels):return F.binary_cross_entropy_with_logits(logits,labels.float())+self.auxiliary_loss
 
 def build_model(name,metadata,config):
-    return LongSeqModel(name,metadata["num_items"],metadata["num_categories"],config.get("dim",32),config.get("topk",20),config.get("recent_length",20),config.get("time_buckets",32),metadata["history_length"],config.get("twin_heads",4))
+    sizes={name:metadata.get(name,0) for name in ("num_authors","num_video_types","num_upload_types","num_durations","num_music_types","num_tags","num_behaviors","num_play_ratios")}
+    return LongSeqModel(name,metadata["num_items"],metadata["num_categories"],config.get("dim",32),config.get("topk",20),config.get("recent_length",20),config.get("time_buckets",32),metadata["history_length"],config.get("twin_heads",4),sizes,metadata.get("user_feature_cardinalities",()),metadata.get("context_cardinalities",(24,7,15,2)))

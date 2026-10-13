@@ -20,9 +20,10 @@ def resolve_device(name):
 def evaluate(model, loader, device):
     model.eval(); labels=[]; logits=[]
     for batch in loader:
-        batch = [value.to(device) for value in batch]
-        labels.extend(batch[-1].cpu().numpy().tolist())
-        logits.extend(model(*batch[:-1]).float().cpu().numpy().tolist())
+        if isinstance(batch,dict):
+            batch={key:value.to(device) for key,value in batch.items()};label=batch.pop("label");labels.extend(label.cpu().numpy().tolist());logits.extend(model(**batch).float().cpu().numpy().tolist())
+        else:
+            batch=[value.to(device) for value in batch];labels.extend(batch[-1].cpu().numpy().tolist());logits.extend(model(*batch[:-1]).float().cpu().numpy().tolist())
     return binary_metrics(labels, logits)
 
 
@@ -40,8 +41,12 @@ def train_one(name, prepared, config, seed):
     for epoch in range(1,int(config.get("epochs",5))+1):
         model.train(); total=0.; seen=0
         for batch in loaders["train"]:
-            batch=[value.to(device) for value in batch]; optimizer.zero_grad(set_to_none=True)
-            logits=model(*batch[:-1]); loss=model.loss(logits,batch[-1])
+            optimizer.zero_grad(set_to_none=True)
+            if isinstance(batch,dict):
+                batch={key:value.to(device) for key,value in batch.items()};labels=batch.pop("label");logits=model(**batch)
+            else:
+                batch=[value.to(device) for value in batch];labels=batch[-1];logits=model(*batch[:-1])
+            loss=model.loss(logits,labels)
             loss.backward(); optimizer.step(); total += float(loss)*len(logits); seen += len(logits)
         valid=evaluate(model,loaders["valid"],device); curve.append({"epoch":epoch,"train_loss":total/seen,**valid})
         if valid["auc"] > best_auc: best_auc=valid["auc"]; best=copy.deepcopy(model.state_dict())

@@ -69,19 +69,22 @@ class LongSeqRecTests(unittest.TestCase):
             path=Path(tmp)/"events.npz";np.savez(path,user_id=[1,1,1,2,2],item_id=[10,11,12,20,21],category_id=[1,1,2,2,2],timestamp=[1,2,3,1,2],label=[1,0,1,1,0])
             indexed=prepare({"kind":"indexed_npz","path":str(path),"history_length":3,"minimum_history":1})
             dataset=indexed.dataset("test");sample=dataset[0]
-            self.assertEqual(sample[2].shape[0],3);self.assertNotIn(int(sample[0]),sample[2].tolist());self.assertTrue(all(value.dtype==torch.long for value in sample))
+            self.assertEqual(sample["history_item"].shape[0],3);self.assertNotIn(int(sample["target_item"]),sample["history_item"].tolist());self.assertTrue(all(value.dtype==torch.long for value in sample.values()))
 
     def test_kuairand_converter(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp);data=root/"data";data.mkdir();headers=["user_id","video_id","time_ms","is_click","long_view"]
+            root=Path(tmp);data=root/"data";data.mkdir();headers=["user_id","video_id","date","hourmin","time_ms","is_click","is_like","is_follow","is_comment","is_forward","is_hate","long_view","play_time_ms","duration_ms","is_profile_enter","is_rand","tab"]
             for name,offset in (("log_standard_4_08_to_4_21_1k.csv",0),("log_standard_4_22_to_5_08_1k.csv",2)):
                 with (data/name).open("w",newline="") as handle:
                     writer=csv.DictWriter(handle,fieldnames=headers);writer.writeheader()
-                    writer.writerow({"user_id":0,"video_id":10+offset,"time_ms":100+offset,"is_click":1,"long_view":1})
+                    writer.writerow({"user_id":0,"video_id":10+offset,"date":20220409,"hourmin":930,"time_ms":100+offset,"is_click":1,"is_like":1,"long_view":1,"play_time_ms":8000,"duration_ms":10000,"is_rand":0,"tab":1})
             with (data/"video_features_basic_1k.csv").open("w",newline="") as handle:
-                writer=csv.DictWriter(handle,fieldnames=["video_id","tag"]);writer.writeheader()
-                writer.writerows([{"video_id":10,"tag":"39,40"},{"video_id":12,"tag":"41"}])
+                fields=["video_id","author_id","video_type","upload_type","video_duration","music_type","tag"];writer=csv.DictWriter(handle,fieldnames=fields);writer.writeheader()
+                writer.writerows([{"video_id":10,"author_id":7,"video_type":"NORMAL","upload_type":"ShortImport","video_duration":10000,"music_type":2,"tag":"39,40"},{"video_id":12,"author_id":8,"video_type":"NORMAL","upload_type":"Kmovie","video_duration":20000,"music_type":3,"tag":"41"}])
+            with (data/"user_features_1k.csv").open("w",newline="") as handle:
+                fields=["user_id","user_active_degree","is_lowactive_period","is_live_streamer","is_video_author","follow_user_num_range","fans_user_num_range","friend_user_num_range","register_days_range"]+[f"onehot_feat{i}" for i in range(18)];writer=csv.DictWriter(handle,fieldnames=fields);writer.writeheader();writer.writerow({name:(0 if name!="user_active_degree" else "full_active") for name in fields})
             output=root/"out.npz";audit=convert(root,output)
-            loaded=np.load(output);self.assertEqual(len(loaded["user_id"]),2);self.assertEqual(audit["categories"],3)
+            loaded=np.load(output);self.assertEqual(len(loaded["user_id"]),2);self.assertEqual(audit["categories"],4);self.assertEqual(loaded["video_tags"].shape,(2,3));self.assertEqual(loaded["user_features"].shape,(1,26));self.assertGreater(int(loaded["behavior_code"][0]),1)
+            indexed=prepare({"kind":"indexed_npz","path":str(output),"history_length":2,"minimum_history":1});sample=indexed.dataset("test")[0];model=build_model("twin",indexed.metadata,{"dim":8,"topk":2,"twin_heads":4}).eval();features={key:value.unsqueeze(0) for key,value in sample.items() if key!="label"};prediction=model(**features);self.assertEqual(tuple(prediction.shape),(1,))
 
 if __name__=="__main__":unittest.main()

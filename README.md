@@ -36,9 +36,8 @@ JSON, CSV, and a Markdown report under the configured output directory.
 
 This is a single-machine research implementation rather than a copy of private
 industrial serving systems. SIM uses hard category search. TWIN implements the
-paper's consistency-preserved multi-head target attention with the available
-KuaiRand fields: item/category as inherent features and time gap as a cross
-feature. DARE separates full attention and representation event encoders.
+paper's consistency-preserved multi-head target attention. DARE separates full
+attention and representation event encoders.
 
 ## Data
 
@@ -70,21 +69,24 @@ Convert the official extracted dataset and run the single-seed 4060 config:
 ```bash
 .venv/bin/python prepare_kuairand.py \
   --root /path/to/KuaiRand-1K \
-  --output data/kuairand_1k.npz \
+  --output data/kuairand_1k_rich.npz \
   --positive-field long_view
-.venv/bin/python run_experiments.py --config configs/kuairand_4060.json
+.venv/bin/python run_experiments.py --config configs/kuairand_mac_rich.json
 ```
 
-The converter streams the large CSV files, derives a coarse category from the
-first video tag, and writes an audit JSON with coverage and label statistics.
-Only earlier positive events enter a sample's history, preventing impression
-and future-information leakage.
+The converter stores user profile fields, author/video/upload type, duration,
+music type, up to three tags, request hour/weekday/tab/random flag, and prior
+event feedback strength. Post-exposure fields such as play time, like, follow
+and comment are supplied only after that event enters history. They are never
+features of the target impression. The monthly video statistic file is
+intentionally excluded because its aggregates cover the evaluation period and
+would leak future information unless rebuilt as past-only statistics.
 
 For all 1,000 users on an 18GB Apple Silicon Mac, use dynamic history indexing:
 
 ```bash
 .venv/bin/python run_experiments.py \
-  --config configs/kuairand_mac_full.json \
+  --config configs/kuairand_mac_rich.json \
   --device mps
 ```
 
